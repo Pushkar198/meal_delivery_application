@@ -1,0 +1,151 @@
+CIROTA / VITALPLATE BACKEND – COMPREHENSIVE WALKTHROUGH
+=======================================================
+
+1. Platform Overview
+--------------------
+- Purpose: provides the Meal Personalization API powering VitalPlate (Cirota) to manage Google-based authentication, user profiling, personalization quiz capture, meal assignments, subscriptions/billing placeholders, complaint workflows, and admin oversight.
+- Tech Stack: FastAPI 0.104, SQLAlchemy 2.0 ORM, PostgreSQL (via psycopg2), Pydantic v2 schemas, httpx for Google token validation, python-jose for JWT, pytz for timezone-safe timestamps. Served via Uvicorn.
+- Entry point: `backend/main.py` bootstraps database metadata, seeds subscription plans, configures CORS (allows `http://localhost:3000` with all methods/headers), and exposes lightweight `/` and `/health` endpoints.
+- API namespace: all feature routers are prefixed with `/api/*`, namely `auth`, `users`, `meals`, `subscriptions`, `complaints`, and `admin`.
+
+2. Configuration & Environment
+------------------------------
+- Settings class (`utils/settings.py`) loads `.env` with aliases:
+  - `DATABASE_URL`: SQLAlchemy connection string consumed by `create_engine`.
+  - `JWT_SECRET_KEY`, `JWT_ALGORITHM`, `JWT_EXPIRATION_MINUTES`: control token cryptography and TTL (default 30 minutes for access, refresh uses max(minutes*24, 60)).
+  - `GOOGLE_CLIENT_ID` & `GOOGLE_CLIENT_SECRET`: used to validate Google ID tokens against OAuth audience.
+  - `APP_HOST`, `APP_PORT`, `ENVIRONMENT`.
+- Settings cached via `@lru_cache` to avoid repeated env parsing.
+- Database session helpers live in `database/database.py` (`engine`, `SessionLocal`, `Base`, and `get_db` dependency). Sessions are `future=True` with explicit commit boundaries.
+
+3. Application Lifecycle & Flow
+-------------------------------
+1. Process start:
+   - `main.py` imports all routers, instantiates FastAPI with metadata, configures CORS, and invokes `Base.metadata.create_all` to auto-create tables.
+2. Startup hook:
+   - `@app.on_event("startup")` runs `seed_subscription_plans` which inserts two default plans (Weekly Wellness, Monthly Momentum) if `subscription_plans` table is empty.
+3. Request handling:
+   - Dependency order: FastAPI injects DB sessions via `Depends(get_db)` and authenticated users via `Depends(get_current_user)`. Admin-only paths layer `utils/security.admin_required`, which itself depends on JWT verification plus `User.is_admin`.
+4. Responses: All outward payloads use Pydantic models under `backend/schemas` to guarantee consistent shapes for requests/responses.
+
+4. Data Model Deep Dive (`database/models.py`)
+---------------------------------------------
+- `User`: core profile; stores Google identity (`google_id`), demographic fields, personalization attributes (diet, allergies, disliked foods, health goals/conditions), quiz results, biometric info, and admin flag. Relationships to subscriptions, meal assignments, complaints, and payments. Timestamp fields are timezone-aware via `pytz.UTC`.
+- `SubscriptionPlan`: catalog of plans with name, duration, per-day price, description, `is_active`.
+- `UserSubscription`: join between user and plan, storing start/end date, status (default `ACTIVE`), and creation timestamp; backrefs to payments.
+- `Meal`: catalog item with macros, ingredients array, dietary tags, vegetarian flag, spice level, and `is_active`.
+- `DailyMealAssignment`: per-user/per-day scheduled meal plus delivery tracking fields (`delivery_status`, `delivered_at`); links to complaints.
+- `Complaint`: references user and meal assignment, tracks type, description, status (`OPEN` default), `admin_notes`, `resolved_at`.
+- `Payment`: records amount, currency (default USD), payment method placeholder, transaction id, and status (default `PENDING`).
+
+5. Authentication & Authorization Flow
+--------------------------------------
+- Google OAuth verification (`auth/google_oauth.py`):
+  - `/api/auth/google` accepts `GoogleAuthRequest` (single `google_token`).
+  - Uses `httpx` to call `https://oauth2.googleapis.com/tokeninfo`, ensures status 200 and `aud` matches configured `GOOGLE_CLIENT_ID`. Failure raises 401.
+  - If Google `sub` (subject) missing -> 400. Otherwise finds/creates `User` (persisting email + name fallback chain).
+- JWT handling (`auth/jwt_handler.py`):
+  - `OAuth2PasswordBearer` expects tokens from `/api/auth/google`.
+  - Access tokens expire per `JWT_EXPIRATION_MINUTES`; refresh tokens last at least one day.
+  - Tokens carry `user_id`, `email`, `is_admin`, and `token_type` (access/refresh).
+  - `get_current_user` decodes bearer token, loads user, raises 401 if missing.
+  - `require_admin` -> 403 when `is_admin` is False.
+- Security utilities (`utils/security.py`) supply `admin_required` dependency and `build_audit_entry` helper (currently unused but ready for logging).
+
+6. API Surface Area (All routes live under `/api/...`)
+-----------------------------------------------------
+A. Authentication (`routes/auth.py`, tag `auth`)
+   - `POST /api/auth/google`: Google sign-in. Body `{"google_token": "<id_token>"}`. Response `AuthResponse` combining `UserResponse` and `TokenResponse`. Creates user on first login.
+   - `POST /api/auth/refresh`: Body `{"refresh_token": "<jwt>"}`. Validates token type, re-issues both tokens.
+   - `GET /api/auth/me`: Requires bearer token; returns current `UserResponse`.
+
+B. User Profile & Quiz (`routes/users.py`, tag `users`)
+   - `GET /api/users/profile`: returns current user profile.
+   - `PUT /api/users/profile`: accepts partial `UserUpdate` to modify demographics/preferences. Simply iterates provided fields and persists them.
+   - `POST /api/users/quiz`: accepts `QuizSubmission` capturing diet + lifestyle inputs. Updates user record and returns `QuizResponse` with confirmation timestamp.
+
+C. Meal Experience (`routes/meals.py`, tag `meals`)
+   - `GET /api/meals/today`: lists `DailyMealAssignment` objects (with nested `meal`) for current date.
+   - `GET /api/meals/upcoming?days=N`: accepts query `days` (1–30, default 7) and returns assignments between `today` and `today + days`.
+   - `POST /api/meals/{assignment_id}/confirm-delivery`: user-level confirmation; sets `delivery_status="DELIVERED"` and stamps `delivered_at`.
+
+D. Subscription Management (`routes/subscriptions.py`, tag `subscriptions`)
+   - `GET /api/subscriptions/plans`: public listing of all active `SubscriptionPlan`s.
+   - `POST /api/subscriptions/subscribe`: body `{"plan_id": <int>}`. Validates plan active, creates `UserSubscription` with `start_date=today`, `end_date=start + duration`. Also creates `Payment` placeholder (amount = price_per_day * duration, status `PENDING`, method `ONLINE`). Returns `SubscriptionResponse`.
+   - `GET /api/subscriptions/current`: returns the most recent active subscription whose `end_date` is >= today (or `null` if none).
+
+E. Complaints Workflow (`routes/complaints.py`, tag `complaints`)
+   - `POST /api/complaints`: body `ComplaintCreate` (assignment_id/type/description). Ensures referenced assignment belongs to current user; on success persists `Complaint` with default status `OPEN`.
+   - `GET /api/complaints`: lists all complaints for authenticated user.
+
+F. Admin Control Plane (`routes/admin.py`, tag `admin`, all endpoints require `admin_required`)
+   - `GET /api/admin/dashboard`: metrics summary (total users, active subscriptions, pending complaints) using SQL aggregation.
+   - `GET /api/admin/customers`: returns every user (`UserResponse` list).
+   - `GET /api/admin/meals`: returns all meals (`MealResponse` list).
+   - `POST /api/admin/meals`: creates meal from `MealCreate`.
+   - `PUT /api/admin/meals/{meal_id}`: partial update via `MealUpdate`; 404 if meal missing.
+   - `GET /api/admin/complaints`: fetches every complaint for moderation.
+   - `PUT /api/admin/complaints/{id}/resolve`: marks complaint `RESOLVED` with canned note.
+
+7. Supporting Endpoints & Middleware
+------------------------------------
+- `GET /` -> `{ "message": "Meal Personalization API is running" }`.
+- `GET /health` -> `{ "status": "healthy" }`.
+- CORS: only `http://localhost:3000` is allowed origin (extend list for other deployments); credentials permitted.
+- No background schedulers beyond startup seeding; any future cron (e.g., generating assignments) would hook into FastAPI background tasks or workers.
+
+8. Data Flow Narrative
+----------------------
+1. User Flow
+   - A new end-user signs in with Google. Backend validates token, stores Google identity, and issues JWT pair.
+   - User calls `/api/users/profile` to view data or `/api/users/profile` (PUT) to enrich attributes (age, body metrics, dietary preferences).
+   - Personalization quiz via `/api/users/quiz` stores additional arrays (allergies, disliked foods, health conditions) that later inform meal planning logic (future extension).
+   - User subscribes to plan via `/api/subscriptions/subscribe`. This creates `UserSubscription` record and a `Payment` entry (actual payment capture handled elsewhere).
+   - Daily meal assignments (assumed to be pre-populated by admin or another service) become visible through `/api/meals/today` and `/api/meals/upcoming`. Deliveries can be confirmed per assignment.
+   - Issues with meals/delivery are recorded through `/api/complaints`, always bound to the user's own assignment for data integrity.
+
+2. Admin Flow
+   - Admins (users with `is_admin=True`) log in the same way but their JWT includes admin flag.
+   - Admin-only routes rely on the `admin_required` dependency, which nests JWT validation before checking `is_admin`.
+   - Dashboard metrics give snapshot of system health. Admins can CRUD meals (create + update) and review/resolve complaints.
+
+9. Schema Highlights
+--------------------
+- All response models set `model_config = {"from_attributes": True}`, enabling SQLAlchemy ORM objects to hydrate Pydantic responses directly.
+- Validation ensures numeric constraints (positive calorie counts, positive biometrics).
+- `MealAssignment` embeds full `MealResponse`, so `/api/meals/*` already contain nutritional metadata without additional lookups.
+
+10. Error Handling & Status Codes
+---------------------------------
+- Standard FastAPI `HTTPException` usage with precise status codes:
+  - 401 Unauthorized: invalid Google token, token audience mismatch, missing/expired JWT, refresh token misuse.
+  - 403 Forbidden: admin-only endpoints when `is_admin` false.
+  - 404 Not Found: missing plans, meals, subscriptions, assignments, complaints.
+  - 400 Bad Request: Google token missing subject.
+- Creation endpoints return 201 where appropriate (complaints, admin meal creation).
+
+11. Extensibility Notes
+-----------------------
+- `utils/security.build_audit_entry` hints at future audit logging.
+- Payment records are placeholders; integrating actual gateways would involve updating status/transaction_id fields.
+- Daily meal assignments currently rely on external population; hooking in a recommendation engine would interact with `DailyMealAssignment` table.
+- CORS origin and environment-specific configs should be widened for production (ENV controlled).
+
+12. Running & Tooling
+---------------------
+- Install deps from `backend/requirements.txt`.
+- Run service with `uvicorn main:app --reload --host ${APP_HOST} --port ${APP_PORT}` from `backend/`.
+- Ensure `.env` contains all required secrets before first launch.
+
+13. Quick Reference of Key Files
+--------------------------------
+- `backend/main.py`: FastAPI setup, router wiring, health endpoints, startup seeds.
+- `backend/database/`: engine/session helpers plus ORM models.
+- `backend/routes/`: feature-specific routers (auth, users, meals, subscriptions, complaints, admin).
+- `backend/schemas/`: request/response models grouped by domain.
+- `backend/auth/`: Google OAuth validation and JWT helpers.
+- `backend/utils/`: environment settings and shared security helpers.
+
+This document should give future developers, auditors, or integrators a complete picture of how the VitalPlate backend is structured, how requests move through dependencies, what data persists, and which endpoints are available for both consumer and admin experiences.
+
+
