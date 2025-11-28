@@ -149,3 +149,4 @@ F. Admin Control Plane (`routes/admin.py`, tag `admin`, all endpoints require `a
 This document should give future developers, auditors, or integrators a complete picture of how the VitalPlate backend is structured, how requests move through dependencies, what data persists, and which endpoints are available for both consumer and admin experiences.
 
 
+
